@@ -37,7 +37,7 @@ func NewProcStat() *ProcStat {
 
 func (ps *ProcStat) parseArgs() Config {
 	config := Config{Limit: 20, Sort: "cpu"}
-	
+
 	for i := 1; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--limit":
@@ -60,11 +60,14 @@ func (ps *ProcStat) parseArgs() Config {
 	return config
 }
 
+// detectHertz tries to determine the kernel HZ value.
+// This method is NOT robust: /proc/sys/kernel/osrelease does not actually contain HZ info on most systems.
+// On modern Linux, HZ is typically 100 or 250. We default to 100.
+// For more robust detection, you could parse /boot/config-$(uname -r) or /proc/config.gz, but that is not portable.
+// This is a best-effort guess and should be documented as such.
 func (ps *ProcStat) detectHertz() float64 {
-	output, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err == nil && strings.Contains(string(output), "HZ=250") {
-		return 250
-	}
+	// Default to 100, which is common on most Linux distributions.
+	// If you want, you can add more sophisticated detection here.
 	return 100
 }
 
@@ -77,7 +80,10 @@ func (ps *ProcStat) getUptime() float64 {
 	if len(fields) < 1 {
 		return 0.1
 	}
-	uptime, _ := strconv.ParseFloat(fields[0], 64)
+	uptime, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0.1
+	}
 	return uptime
 }
 
@@ -88,7 +94,7 @@ func (ps *ProcStat) Run() {
 
 func (ps *ProcStat) scanProcesses() []Process {
 	var processes []Process
-	
+
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return processes
@@ -109,6 +115,8 @@ func (ps *ProcStat) scanProcesses() []Process {
 	return processes
 }
 
+// Field indices for /proc/[pid]/stat are chosen according to proc(5) documentation.
+// If the kernel changes the layout, these may break: update as needed.
 func (ps *ProcStat) readProcess(pid int) *Process {
 	statData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -136,7 +144,7 @@ func (ps *ProcStat) readProcess(pid int) *Process {
 
 	totalTime := utime + stime + cutime + cstime
 	seconds := ps.uptime - (starttime / ps.hertz)
-	
+
 	var cpu float64
 	if seconds > 0 {
 		cpu = 100 * ((totalTime / ps.hertz) / seconds)
@@ -166,8 +174,10 @@ func (ps *ProcStat) getProcessMemory(pid int) float64 {
 		if strings.HasPrefix(line, "VmRSS:") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
-				memKB, _ := strconv.ParseFloat(fields[1], 64)
-				return memKB / 1024
+				memKB, err := strconv.ParseFloat(fields[1], 64)
+				if err == nil {
+					return memKB / 1024
+				}
 			}
 		}
 	}
@@ -176,17 +186,13 @@ func (ps *ProcStat) getProcessMemory(pid int) float64 {
 
 func (ps *ProcStat) getProcessCmd(pid int, fallback string) string {
 	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	if err != nil {
-		return "[" + fallback + "]"
-	}
-
-	if len(cmdline) == 0 {
+	if err != nil || len(cmdline) == 0 {
 		return "[" + fallback + "]"
 	}
 
 	cmd := strings.ReplaceAll(string(cmdline), "\x00", " ")
 	cmd = strings.TrimSpace(cmd)
-	
+
 	if len(cmd) > 80 {
 		cmd = cmd[:77] + "..."
 	}
@@ -194,16 +200,20 @@ func (ps *ProcStat) getProcessCmd(pid int, fallback string) string {
 }
 
 func (ps *ProcStat) render(processes []Process) {
-	sort.Slice(processes, func(i, j int) bool {
-		switch ps.config.Sort {
-		case "mem":
+	switch ps.config.Sort {
+	case "mem":
+		sort.Slice(processes, func(i, j int) bool {
 			return processes[i].Memory > processes[j].Memory
-		case "pid":
+		})
+	case "pid":
+		sort.Slice(processes, func(i, j int) bool {
 			return processes[i].PID > processes[j].PID
-		default:
+		})
+	default: // "cpu"
+		sort.Slice(processes, func(i, j int) bool {
 			return processes[i].CPU > processes[j].CPU
-		}
-	})
+		})
+	}
 
 	limit := ps.config.Limit
 	if limit > len(processes) {
