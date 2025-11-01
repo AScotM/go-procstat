@@ -42,7 +42,7 @@ func (ps *ProcStat) parseArgs() Config {
 		switch os.Args[i] {
 		case "--limit":
 			if i+1 < len(os.Args) {
-				if limit, err := strconv.Atoi(os.Args[i+1]); err == nil && limit > 0 {
+				if limit, err := strconv.Atoi(os.Args[i+1]); err == nil && limit > 0 && limit <= 1000 {
 					config.Limit = limit
 				}
 				i++
@@ -60,14 +60,7 @@ func (ps *ProcStat) parseArgs() Config {
 	return config
 }
 
-// detectHertz tries to determine the kernel HZ value.
-// This method is NOT robust: /proc/sys/kernel/osrelease does not actually contain HZ info on most systems.
-// On modern Linux, HZ is typically 100 or 250. We default to 100.
-// For more robust detection, you could parse /boot/config-$(uname -r) or /proc/config.gz, but that is not portable.
-// This is a best-effort guess and should be documented as such.
 func (ps *ProcStat) detectHertz() float64 {
-	// Default to 100, which is common on most Linux distributions.
-	// If you want, you can add more sophisticated detection here.
 	return 100
 }
 
@@ -115,8 +108,11 @@ func (ps *ProcStat) scanProcesses() []Process {
 	return processes
 }
 
-// Field indices for /proc/[pid]/stat are chosen according to proc(5) documentation.
-// If the kernel changes the layout, these may break: update as needed.
+func parseField(field string) float64 {
+	val, _ := strconv.ParseFloat(field, 64)
+	return val
+}
+
 func (ps *ProcStat) readProcess(pid int) *Process {
 	statData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -136,11 +132,11 @@ func (ps *ProcStat) readProcess(pid int) *Process {
 		return nil
 	}
 
-	utime, _ := strconv.ParseFloat(remaining[11], 64)
-	stime, _ := strconv.ParseFloat(remaining[12], 64)
-	cutime, _ := strconv.ParseFloat(remaining[13], 64)
-	cstime, _ := strconv.ParseFloat(remaining[14], 64)
-	starttime, _ := strconv.ParseFloat(remaining[19], 64)
+	utime := parseField(remaining[11])
+	stime := parseField(remaining[12])
+	cutime := parseField(remaining[13])
+	cstime := parseField(remaining[14])
+	starttime := parseField(remaining[19])
 
 	totalTime := utime + stime + cutime + cstime
 	seconds := ps.uptime - (starttime / ps.hertz)
@@ -209,7 +205,7 @@ func (ps *ProcStat) render(processes []Process) {
 		sort.Slice(processes, func(i, j int) bool {
 			return processes[i].PID > processes[j].PID
 		})
-	default: // "cpu"
+	default:
 		sort.Slice(processes, func(i, j int) bool {
 			return processes[i].CPU > processes[j].CPU
 		})
