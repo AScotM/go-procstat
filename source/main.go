@@ -281,8 +281,9 @@ func (ps *ProcStat) runWatchMode() {
 }
 
 func (ps *ProcStat) displayHeader(iteration int, uptime float64) {
-	fmt.Printf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs - Cores: %d\n", iteration+1,
-		time.Now().Format("2006-01-02 15:04:05"), uptime, ps.cpuCores)
+	maxCpuPercentage := float64(ps.cpuCores * 100)
+	fmt.Printf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs - Cores: %d (Max CPU: %.0f%%)\n", 
+		iteration+1, time.Now().Format("2006-01-02 15:04:05"), uptime, ps.cpuCores, maxCpuPercentage)
 	fmt.Printf("Sorting by: %s | Showing top: %d | Refresh: %ds",
 		strings.ToUpper(ps.config.Sort), ps.config.Limit, ps.config.Interval)
 
@@ -752,7 +753,8 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 
 		if !isWatchMode {
 			fmt.Println(strings.Repeat("-", 80))
-			fmt.Printf("Showing %d processes in tree view\n", len(printed))
+			fmt.Printf("Showing %d processes in tree view (Max CPU: %.0f%% = %d cores * 100%%)\n", 
+				len(printed), float64(ps.cpuCores*100), ps.cpuCores)
 		}
 	} else {
 		fmt.Printf("%-6s %-6s %-10s %-6s %s\n", "PID", "CPU%", "MEM(MB)", "STATE", "COMMAND")
@@ -780,7 +782,8 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 			if ps.config.Zombie && errorCount > 0 {
 				fmt.Printf(" | %d errors", errorCount)
 			}
-			fmt.Printf("\n")
+			fmt.Printf("\nCPU percentage represents actual usage (Max: %.0f%% = %d cores * 100%%)\n", 
+				float64(ps.cpuCores*100), ps.cpuCores)
 		}
 	}
 }
