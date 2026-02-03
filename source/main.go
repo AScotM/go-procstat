@@ -34,20 +34,21 @@ type Process struct {
 }
 
 type Config struct {
-	Limit      int
-	Sort       string
-	Watch      bool
-	Interval   int
-	Verbose    bool
-	Zombie     bool
-	Threads    bool
+	Limit       int
+	Sort        string
+	Watch       bool
+	Interval    int
+	Verbose     bool
+	Zombie      bool
+	Threads     bool
 	ThreadLimit int
-	Tree       bool
+	Tree        bool
 }
 
 type ProcStat struct {
-	hertz  float64
-	config Config
+	hertz    float64
+	config   Config
+	cpuCores int
 }
 
 const (
@@ -58,7 +59,13 @@ const (
 	MaxPIDScan        = 32768
 	MaxCmdLength      = 80
 	MaxThreadsPerProc = 1000
+	KBToMB            = 1024.0
+	MaxJiffies        = 1<<31 - 1
 )
+
+var processPool = sync.Pool{
+	New: func() interface{} { return &Process{} },
+}
 
 func NewProcStat() *ProcStat {
 	if runtime.GOOS != "linux" {
@@ -70,7 +77,28 @@ func NewProcStat() *ProcStat {
 	ps.validateProcFilesystem()
 	ps.config = ps.parseArgs()
 	ps.hertz = ps.detectHertz()
+	ps.cpuCores = ps.detectCPUCores()
 	return ps
+}
+
+func (ps *ProcStat) detectCPUCores() int {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return 1
+	}
+	
+	cores := 0
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "processor") {
+			cores++
+		}
+	}
+	
+	if cores == 0 {
+		return 1
+	}
+	return cores
 }
 
 func (ps *ProcStat) validateProcFilesystem() {
@@ -207,11 +235,14 @@ func (ps *ProcStat) runWatchMode() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigChan)
 
 	go func() {
-		<-sigChan
-		cancel()
+		select {
+		case <-sigChan:
+			cancel()
+		case <-ctx.Done():
+		}
+		signal.Stop(sigChan)
 	}()
 
 	iteration := 0
@@ -250,8 +281,8 @@ func (ps *ProcStat) runWatchMode() {
 }
 
 func (ps *ProcStat) displayHeader(iteration int, uptime float64) {
-	fmt.Printf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs\n", iteration+1,
-		time.Now().Format("2006-01-02 15:04:05"), uptime)
+	fmt.Printf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs - Cores: %d\n", iteration+1,
+		time.Now().Format("2006-01-02 15:04:05"), uptime, ps.cpuCores)
 	fmt.Printf("Sorting by: %s | Showing top: %d | Refresh: %ds",
 		strings.ToUpper(ps.config.Sort), ps.config.Limit, ps.config.Interval)
 
@@ -280,7 +311,7 @@ func (ps *ProcStat) scanProcesses() ([]Process, int, int) {
 }
 
 func (ps *ProcStat) scanProcessesWithUptime(uptime float64) ([]Process, int, int) {
-	processes := make([]Process, 0, 500)
+	processes := make([]Process, 0, 1000)
 	procCount := 0
 	errorCount := 0
 
@@ -324,6 +355,8 @@ func (ps *ProcStat) scanProcessesWithUptime(uptime float64) ([]Process, int, int
 				threads := ps.readThreads(pid, uptime)
 				processes = append(processes, threads...)
 			}
+			
+			processPool.Put(proc)
 		} else {
 			errorCount++
 		}
@@ -351,6 +384,13 @@ func parseIntField(field string) int {
 		return 0
 	}
 	return int(val)
+}
+
+func safeJiffiesDiff(current, prev float64) float64 {
+	if current < prev {
+		return (MaxJiffies - prev) + current
+	}
+	return current - prev
 }
 
 func (ps *ProcStat) readProcess(pid int, uptime float64) *Process {
@@ -404,24 +444,22 @@ func (ps *ProcStat) readProcess(pid int, uptime float64) *Process {
 	var cpu float64
 	if seconds > MinUptime {
 		cpu = 100 * ((totalTime / ps.hertz) / seconds)
-		if cpu > 100 {
-			cpu = 100
-		}
 	}
 
 	memory := ps.getProcessMemory(pid)
 	cmd := ps.getProcessCmd(pid, cmdName)
 
-	return &Process{
-		PID:    pid,
-		CPU:    math.Round(cpu*10) / 10,
-		Memory: math.Round(memory*10) / 10,
-		Cmd:    cmd,
-		State:  state,
-		PPID:   ppid,
-		Time:   totalTime / ps.hertz,
-		Type:   "process",
-	}
+	proc := processPool.Get().(*Process)
+	proc.PID = pid
+	proc.CPU = math.Round(cpu*10) / 10
+	proc.Memory = math.Round(memory*10) / 10
+	proc.Cmd = cmd
+	proc.State = state
+	proc.PPID = ppid
+	proc.Time = totalTime / ps.hertz
+	proc.Type = "process"
+
+	return proc
 }
 
 func (ps *ProcStat) readThreads(pid int, uptime float64) []Process {
@@ -450,6 +488,7 @@ func (ps *ProcStat) readThreads(pid int, uptime float64) []Process {
 
 		if thread := ps.readThread(pid, tid, uptime); thread != nil {
 			threads = append(threads, *thread)
+			processPool.Put(thread)
 			threadCount++
 		}
 	}
@@ -489,23 +528,22 @@ func (ps *ProcStat) readThread(pid, tid int, uptime float64) *Process {
 	var cpu float64
 	if uptime > MinUptime {
 		cpu = 100 * ((totalTime / ps.hertz) / uptime)
-		if cpu > 100 {
-			cpu = 100
-		}
 	}
 
 	memory := ps.getProcessMemory(tid)
 	cmd := "└─ " + sanitizeCmd(cmdName)
 
-	return &Process{
-		PID:    tid,
-		CPU:    math.Round(cpu*10) / 10,
-		Memory: math.Round(memory*10) / 10,
-		Cmd:    cmd,
-		State:  state,
-		Time:   totalTime / ps.hertz,
-		Type:   "thread",
-	}
+	proc := processPool.Get().(*Process)
+	proc.PID = tid
+	proc.CPU = math.Round(cpu*10) / 10
+	proc.Memory = math.Round(memory*10) / 10
+	proc.Cmd = cmd
+	proc.State = state
+	proc.PPID = pid
+	proc.Time = totalTime / ps.hertz
+	proc.Type = "thread"
+
+	return proc
 }
 
 func (ps *ProcStat) getProcessMemory(pid int) float64 {
@@ -544,10 +582,10 @@ func (ps *ProcStat) getProcessMemory(pid int) float64 {
 	}
 
 	if rss > 0 {
-		return rss / 1024
+		return rss / KBToMB
 	}
 
-	return vms / 1024
+	return vms / KBToMB
 }
 
 func sanitizeCmd(cmd string) string {
@@ -599,9 +637,12 @@ func (ps *ProcStat) getProcessCmd(pid int, fallback string) string {
 	return truncateString(cmd, MaxCmdLength)
 }
 
-func (ps *ProcStat) buildProcessTree(processes []Process) map[int][]Process {
+func (ps *ProcStat) buildProcessTree(processes []Process) (map[int][]Process, map[int]bool) {
 	tree := make(map[int][]Process)
+	exists := make(map[int]bool, len(processes))
+	
 	for _, proc := range processes {
+		exists[proc.PID] = true
 		if proc.PPID > 0 {
 			tree[proc.PPID] = append(tree[proc.PPID], proc)
 		}
@@ -613,14 +654,14 @@ func (ps *ProcStat) buildProcessTree(processes []Process) map[int][]Process {
 		})
 	}
 
-	return tree
+	return tree, exists
 }
 
-func (ps *ProcStat) printTree(process Process, tree map[int][]Process, prefix string, depth int, printed *sync.Map) {
-	if _, exists := printed.Load(process.PID); exists {
+func (ps *ProcStat) printTree(process Process, tree map[int][]Process, exists map[int]bool, prefix string, depth int, printed map[int]bool) {
+	if printed[process.PID] {
 		return
 	}
-	printed.Store(process.PID, true)
+	printed[process.PID] = true
 
 	fmt.Printf("%s", prefix)
 	if depth > 0 {
@@ -640,7 +681,7 @@ func (ps *ProcStat) printTree(process Process, tree map[int][]Process, prefix st
 				childPrefix += "│   "
 			}
 		}
-		ps.printTree(child, tree, childPrefix, depth+1, printed)
+		ps.printTree(child, tree, exists, childPrefix, depth+1, printed)
 	}
 }
 
@@ -690,26 +731,28 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 	displayProcesses := processes[:limit]
 
 	if ps.config.Tree {
-		tree := ps.buildProcessTree(displayProcesses)
-		printed := &sync.Map{}
+		tree, exists := ps.buildProcessTree(processes)
+		printed := make(map[int]bool)
 
 		fmt.Printf("%-6s %-6s %-10s %-6s %s\n", "PID", "CPU%", "MEM(MB)", "STATE", "COMMAND")
 		fmt.Println(strings.Repeat("-", 80))
 
 		rootProcesses := make([]Process, 0)
-		for _, proc := range displayProcesses {
-			if proc.PPID == 0 || !ps.processExists(proc.PPID, displayProcesses) {
+		for _, proc := range processes {
+			if proc.PPID == 0 || !exists[proc.PPID] {
 				rootProcesses = append(rootProcesses, proc)
 			}
 		}
 
+		rootProcesses = rootProcesses[:min(len(rootProcesses), limit)]
+
 		for _, root := range rootProcesses {
-			ps.printTree(root, tree, "", 0, printed)
+			ps.printTree(root, tree, exists, "", 0, printed)
 		}
 
 		if !isWatchMode {
 			fmt.Println(strings.Repeat("-", 80))
-			fmt.Printf("Showing %d processes in tree view\n", len(displayProcesses))
+			fmt.Printf("Showing %d processes in tree view\n", len(printed))
 		}
 	} else {
 		fmt.Printf("%-6s %-6s %-10s %-6s %s\n", "PID", "CPU%", "MEM(MB)", "STATE", "COMMAND")
@@ -742,13 +785,11 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 	}
 }
 
-func (ps *ProcStat) processExists(pid int, processes []Process) bool {
-	for _, proc := range processes {
-		if proc.PID == pid {
-			return true
-		}
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	return false
+	return b
 }
 
 func main() {
