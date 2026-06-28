@@ -15,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -51,21 +50,32 @@ type ProcStat struct {
 	cpuCores int
 }
 
+type ProcessStats struct {
+	CmdName   string
+	State     string
+	PPID      int
+	Utime     float64
+	Stime     float64
+	Cutime    float64
+	Cstime    float64
+	Starttime float64
+}
+
 const (
-	DefaultLimit      = 20
-	DefaultInterval   = 2
-	DefaultHertz      = 100
-	MinUptime         = 0.1
-	MaxPIDScan        = 32768
-	MaxCmdLength      = 80
-	MaxThreadsPerProc = 1000
-	KBToMB            = 1024.0
-	MaxJiffies        = 1<<31 - 1
+	DefaultLimit         = 20
+	DefaultInterval      = 2
+	DefaultHertz         = 100
+	MinUptime            = 0.1
+	MaxPIDScan           = 32768
+	MaxCmdLength         = 80
+	MaxThreadsPerProc    = 1000
+	KBToMB               = 1024.0
+	MaxJiffies           = 1<<31 - 1
+	MinStatFields        = 22
+	MinThreadStatFields  = 14
 )
 
-var processPool = sync.Pool{
-	New: func() interface{} { return &Process{} },
-}
+var validProcPaths = regexp.MustCompile(`^/proc/(\d+|self)(/task/\d+)?(/stat|/status|/cmdline)?$`)
 
 func NewProcStat() *ProcStat {
 	if runtime.GOOS != "linux" {
@@ -86,7 +96,7 @@ func (ps *ProcStat) detectCPUCores() int {
 	if err != nil {
 		return 1
 	}
-	
+
 	cores := 0
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
@@ -94,7 +104,7 @@ func (ps *ProcStat) detectCPUCores() int {
 			cores++
 		}
 	}
-	
+
 	if cores == 0 {
 		return 1
 	}
@@ -103,12 +113,14 @@ func (ps *ProcStat) detectCPUCores() int {
 
 func (ps *ProcStat) validateProcFilesystem() {
 	if _, err := os.Stat("/proc"); os.IsNotExist(err) {
-		panic("'/proc' filesystem not available")
+		fmt.Fprintf(os.Stderr, "Error: '/proc' filesystem not available\n")
+		os.Exit(1)
 	}
 
 	if _, err := os.Stat("/proc/self"); os.IsNotExist(err) {
 		if _, err := os.Stat("/proc/version"); os.IsNotExist(err) {
-			panic("'/proc' does not appear to be a valid proc filesystem")
+			fmt.Fprintf(os.Stderr, "Error: '/proc' does not appear to be a valid proc filesystem\n")
+			os.Exit(1)
 		}
 	}
 }
@@ -172,14 +184,14 @@ func (ps *ProcStat) parseArgs() Config {
 }
 
 func (ps *ProcStat) validateProcPath(path string) bool {
-	cleanPath := filepath.Clean(path)
-
-	if !strings.HasPrefix(cleanPath, "/proc/") {
-		return false
+	if strings.HasPrefix(path, "/proc/uptime") ||
+		strings.HasPrefix(path, "/proc/cpuinfo") ||
+		strings.HasPrefix(path, "/proc/version") ||
+		strings.HasPrefix(path, "/proc/self") {
+		return true
 	}
-
-	allowedPattern := regexp.MustCompile(`^/proc/(\d+|self)(/task/\d+)?(/stat|/status|/cmdline)?$`)
-	return allowedPattern.MatchString(cleanPath)
+	cleanPath := filepath.Clean(path)
+	return validProcPaths.MatchString(cleanPath)
 }
 
 func (ps *ProcStat) detectHertz() float64 {
@@ -242,7 +254,6 @@ func (ps *ProcStat) runWatchMode() {
 			cancel()
 		case <-ctx.Done():
 		}
-		signal.Stop(sigChan)
 	}()
 
 	iteration := 0
@@ -259,6 +270,7 @@ func (ps *ProcStat) runWatchMode() {
 		case <-ctx.Done():
 			duration := time.Since(startTime).Round(time.Second)
 			fmt.Printf("\nMonitoring stopped after %v\n", duration)
+			signal.Stop(sigChan)
 			return
 		default:
 		}
@@ -282,7 +294,7 @@ func (ps *ProcStat) runWatchMode() {
 
 func (ps *ProcStat) displayHeader(iteration int, uptime float64) {
 	maxCpuPercentage := float64(ps.cpuCores * 100)
-	fmt.Printf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs - Cores: %d (Max CPU: %.0f%%)\n", 
+	fmt.Printf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs - Cores: %d (Max CPU: %.0f%%)\n",
 		iteration+1, time.Now().Format("2006-01-02 15:04:05"), uptime, ps.cpuCores, maxCpuPercentage)
 	fmt.Printf("Sorting by: %s | Showing top: %d | Refresh: %ds",
 		strings.ToUpper(ps.config.Sort), ps.config.Limit, ps.config.Interval)
@@ -306,7 +318,8 @@ func (ps *ProcStat) displayHeader(iteration int, uptime float64) {
 func (ps *ProcStat) scanProcesses() ([]Process, int, int) {
 	uptime, err := getUptime()
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Error getting uptime: %v\n", err)
+		return []Process{}, 0, 0
 	}
 	return ps.scanProcessesWithUptime(uptime)
 }
@@ -334,7 +347,10 @@ func (ps *ProcStat) scanProcessesWithUptime(uptime float64) ([]Process, int, int
 	}
 
 	if len(entries) > MaxPIDScan {
-		panic(fmt.Sprintf("Too many processes to scan (%d), possible attack", len(entries)))
+		if ps.config.Verbose {
+			fmt.Fprintf(os.Stderr, "Warning: Too many processes (%d), limiting scan\n", len(entries))
+		}
+		entries = entries[:MaxPIDScan]
 	}
 
 	for _, entry := range entries {
@@ -356,8 +372,6 @@ func (ps *ProcStat) scanProcessesWithUptime(uptime float64) ([]Process, int, int
 				threads := ps.readThreads(pid, uptime)
 				processes = append(processes, threads...)
 			}
-			
-			processPool.Put(proc)
 		} else {
 			errorCount++
 		}
@@ -394,6 +408,43 @@ func safeJiffiesDiff(current, prev float64) float64 {
 	return current - prev
 }
 
+func parseProcStat(statData []byte) (*ProcessStats, error) {
+	statStr := string(statData)
+
+	start := strings.IndexRune(statStr, '(')
+	end := strings.LastIndex(statStr, ")")
+	if start == -1 || end == -1 {
+		return nil, fmt.Errorf("invalid stat format")
+	}
+
+	cmdName := statStr[start+1 : end]
+	remaining := strings.Fields(statStr[end+2:])
+
+	stats := &ProcessStats{
+		CmdName: cmdName,
+	}
+
+	if len(remaining) >= MinStatFields {
+		stats.State = remaining[0]
+		stats.PPID = parseIntField(remaining[1])
+		stats.Utime = parseFloatField(remaining[11])
+		stats.Stime = parseFloatField(remaining[12])
+		stats.Cutime = parseFloatField(remaining[13])
+		stats.Cstime = parseFloatField(remaining[14])
+		stats.Starttime = parseFloatField(remaining[19])
+		return stats, nil
+	}
+
+	if len(remaining) >= MinThreadStatFields {
+		stats.State = remaining[0]
+		stats.Utime = parseFloatField(remaining[11])
+		stats.Stime = parseFloatField(remaining[12])
+		return stats, nil
+	}
+
+	return nil, fmt.Errorf("insufficient fields in stat")
+}
+
 func (ps *ProcStat) readProcess(pid int, uptime float64) *Process {
 	statPath := fmt.Sprintf("/proc/%d/stat", pid)
 	if !ps.validateProcPath(statPath) {
@@ -411,36 +462,22 @@ func (ps *ProcStat) readProcess(pid int, uptime float64) *Process {
 		return nil
 	}
 
-	statStr := string(statData)
-
 	if !ps.config.Zombie {
-		if idx := strings.Index(statStr, ") Z "); idx != -1 {
+		if strings.Contains(string(statData), ") Z ") {
 			return nil
 		}
 	}
 
-	start := strings.IndexRune(statStr, '(')
-	end := strings.LastIndex(statStr, ")")
-	if start == -1 || end == -1 {
+	stats, err := parseProcStat(statData)
+	if err != nil {
+		if ps.config.Verbose {
+			fmt.Fprintf(os.Stderr, "Debug: Error parsing %s: %v\n", statPath, err)
+		}
 		return nil
 	}
 
-	cmdName := statStr[start+1 : end]
-	remaining := strings.Fields(statStr[end+2:])
-	if len(remaining) < 22 {
-		return nil
-	}
-
-	state := remaining[0]
-	ppid := parseIntField(remaining[1])
-	utime := parseFloatField(remaining[11])
-	stime := parseFloatField(remaining[12])
-	cutime := parseFloatField(remaining[13])
-	cstime := parseFloatField(remaining[14])
-	starttime := parseFloatField(remaining[19])
-
-	totalTime := utime + stime + cutime + cstime
-	seconds := uptime - (starttime / ps.hertz)
+	totalTime := stats.Utime + stats.Stime + stats.Cutime + stats.Cstime
+	seconds := uptime - (stats.Starttime / ps.hertz)
 
 	var cpu float64
 	if seconds > MinUptime {
@@ -448,17 +485,18 @@ func (ps *ProcStat) readProcess(pid int, uptime float64) *Process {
 	}
 
 	memory := ps.getProcessMemory(pid)
-	cmd := ps.getProcessCmd(pid, cmdName)
+	cmd := ps.getProcessCmd(pid, stats.CmdName)
 
-	proc := processPool.Get().(*Process)
-	proc.PID = pid
-	proc.CPU = math.Round(cpu*10) / 10
-	proc.Memory = math.Round(memory*10) / 10
-	proc.Cmd = cmd
-	proc.State = state
-	proc.PPID = ppid
-	proc.Time = totalTime / ps.hertz
-	proc.Type = "process"
+	proc := &Process{
+		PID:    pid,
+		CPU:    math.Round(cpu*10) / 10,
+		Memory: math.Round(memory*10) / 10,
+		Cmd:    cmd,
+		State:  stats.State,
+		PPID:   stats.PPID,
+		Time:   totalTime / ps.hertz,
+		Type:   "process",
+	}
 
 	return proc
 }
@@ -489,7 +527,6 @@ func (ps *ProcStat) readThreads(pid int, uptime float64) []Process {
 
 		if thread := ps.readThread(pid, tid, uptime); thread != nil {
 			threads = append(threads, *thread)
-			processPool.Put(thread)
 			threadCount++
 		}
 	}
@@ -508,41 +545,30 @@ func (ps *ProcStat) readThread(pid, tid int, uptime float64) *Process {
 		return nil
 	}
 
-	statStr := string(statData)
-	start := strings.IndexRune(statStr, '(')
-	end := strings.LastIndex(statStr, ")")
-	if start == -1 || end == -1 {
+	stats, err := parseProcStat(statData)
+	if err != nil {
 		return nil
 	}
 
-	cmdName := statStr[start+1 : end]
-	remaining := strings.Fields(statStr[end+2:])
-	if len(remaining) < 14 {
-		return nil
-	}
-
-	state := remaining[0]
-	utime := parseFloatField(remaining[11])
-	stime := parseFloatField(remaining[12])
-
-	totalTime := utime + stime
+	totalTime := stats.Utime + stats.Stime
 	var cpu float64
 	if uptime > MinUptime {
 		cpu = 100 * ((totalTime / ps.hertz) / uptime)
 	}
 
 	memory := ps.getProcessMemory(tid)
-	cmd := "└─ " + sanitizeCmd(cmdName)
+	cmd := "└─ " + sanitizeCmd(stats.CmdName)
 
-	proc := processPool.Get().(*Process)
-	proc.PID = tid
-	proc.CPU = math.Round(cpu*10) / 10
-	proc.Memory = math.Round(memory*10) / 10
-	proc.Cmd = cmd
-	proc.State = state
-	proc.PPID = pid
-	proc.Time = totalTime / ps.hertz
-	proc.Type = "thread"
+	proc := &Process{
+		PID:    tid,
+		CPU:    math.Round(cpu*10) / 10,
+		Memory: math.Round(memory*10) / 10,
+		Cmd:    cmd,
+		State:  stats.State,
+		PPID:   pid,
+		Time:   totalTime / ps.hertz,
+		Type:   "thread",
+	}
 
 	return proc
 }
@@ -580,6 +606,13 @@ func (ps *ProcStat) getProcessMemory(pid int) float64 {
 				}
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		if ps.config.Verbose {
+			fmt.Fprintf(os.Stderr, "Debug: Error scanning %s: %v\n", statusPath, err)
+		}
+		return 0
 	}
 
 	if rss > 0 {
@@ -641,7 +674,7 @@ func (ps *ProcStat) getProcessCmd(pid int, fallback string) string {
 func (ps *ProcStat) buildProcessTree(processes []Process) (map[int][]Process, map[int]bool) {
 	tree := make(map[int][]Process)
 	exists := make(map[int]bool, len(processes))
-	
+
 	for _, proc := range processes {
 		exists[proc.PID] = true
 		if proc.PPID > 0 {
@@ -658,9 +691,9 @@ func (ps *ProcStat) buildProcessTree(processes []Process) (map[int][]Process, ma
 	return tree, exists
 }
 
-func (ps *ProcStat) printTree(process Process, tree map[int][]Process, exists map[int]bool, prefix string, depth int, printed map[int]bool) {
+func (ps *ProcStat) printTree(process Process, tree map[int][]Process, exists map[int]bool, prefix string, depth int, printed map[int]bool) int {
 	if printed[process.PID] {
-		return
+		return 0
 	}
 	printed[process.PID] = true
 
@@ -672,6 +705,7 @@ func (ps *ProcStat) printTree(process Process, tree map[int][]Process, exists ma
 	fmt.Printf("%-6d %-6.1f %-10.1f %-6s %s\n",
 		process.PID, process.CPU, process.Memory, process.State, process.Cmd)
 
+	count := 1
 	children := tree[process.PID]
 	for i, child := range children {
 		childPrefix := prefix
@@ -682,8 +716,10 @@ func (ps *ProcStat) printTree(process Process, tree map[int][]Process, exists ma
 				childPrefix += "│   "
 			}
 		}
-		ps.printTree(child, tree, exists, childPrefix, depth+1, printed)
+		count += ps.printTree(child, tree, exists, childPrefix, depth+1, printed)
 	}
+
+	return count
 }
 
 func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWatchMode bool) {
@@ -729,8 +765,6 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 		limit = len(processes)
 	}
 
-	displayProcesses := processes[:limit]
-
 	if ps.config.Tree {
 		tree, exists := ps.buildProcessTree(processes)
 		printed := make(map[int]bool)
@@ -745,18 +779,22 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 			}
 		}
 
-		rootProcesses = rootProcesses[:min(len(rootProcesses), limit)]
-
+		printedCount := 0
 		for _, root := range rootProcesses {
-			ps.printTree(root, tree, exists, "", 0, printed)
+			if printedCount >= limit {
+				break
+			}
+			printedCount += ps.printTree(root, tree, exists, "", 0, printed)
 		}
 
 		if !isWatchMode {
 			fmt.Println(strings.Repeat("-", 80))
-			fmt.Printf("Showing %d processes in tree view (Max CPU: %.0f%% = %d cores * 100%%)\n", 
-				len(printed), float64(ps.cpuCores*100), ps.cpuCores)
+			fmt.Printf("Showing %d processes in tree view (Max CPU: %.0f%% = %d cores * 100%%)\n",
+				printedCount, float64(ps.cpuCores*100), ps.cpuCores)
 		}
 	} else {
+		displayProcesses := processes[:limit]
+
 		fmt.Printf("%-6s %-6s %-10s %-6s %s\n", "PID", "CPU%", "MEM(MB)", "STATE", "COMMAND")
 		fmt.Println(strings.Repeat("-", 80))
 
@@ -782,7 +820,7 @@ func (ps *ProcStat) render(processes []Process, procCount, errorCount int, isWat
 			if ps.config.Zombie && errorCount > 0 {
 				fmt.Printf(" | %d errors", errorCount)
 			}
-			fmt.Printf("\nCPU percentage represents actual usage (Max: %.0f%% = %d cores * 100%%)\n", 
+			fmt.Printf("\nCPU percentage represents actual usage (Max: %.0f%% = %d cores * 100%%)\n",
 				float64(ps.cpuCores*100), ps.cpuCores)
 		}
 	}
