@@ -73,6 +73,8 @@ const (
 	MaxJiffies           = 1<<31 - 1
 	MinStatFields        = 22
 	MinThreadStatFields  = 14
+	MaxTreeDepth         = 100
+	MaxPIDDisplay        = 1000000
 )
 
 var validProcPaths = regexp.MustCompile(`^/proc/(\d+|self)(/task/\d+)?(/stat|/status|/cmdline)?$`)
@@ -257,38 +259,34 @@ func (ps *ProcStat) runWatchMode() {
 	}()
 
 	iteration := 0
-	startTime := time.Now()
+	ticker := time.NewTicker(time.Duration(ps.config.Interval) * time.Second)
+	defer ticker.Stop()
 
 	fmt.Printf("Process Monitor - Refresh every %ds (Ctrl+C to stop)\n", ps.config.Interval)
 
 	for {
-		if iteration > 0 {
-			fmt.Print("\033[2J\033[H")
-		}
-
 		select {
 		case <-ctx.Done():
-			duration := time.Since(startTime).Round(time.Second)
-			fmt.Printf("\nMonitoring stopped after %v\n", duration)
+			fmt.Printf("\nMonitoring stopped\n")
 			signal.Stop(sigChan)
 			return
-		default:
-		}
+		case <-ticker.C:
+			if iteration > 0 {
+				fmt.Print("\033[2J\033[H")
+			}
 
-		uptime, err := getUptime()
-		if err != nil {
-			fmt.Printf("Error getting uptime: %v\n", err)
-			time.Sleep(time.Duration(ps.config.Interval) * time.Second)
+			uptime, err := getUptime()
+			if err != nil {
+				fmt.Printf("Error getting uptime: %v\n", err)
+				iteration++
+				continue
+			}
+
+			ps.displayHeader(iteration, uptime)
+			processes, procCount, errorCount := ps.scanProcessesWithUptime(uptime)
+			ps.render(processes, procCount, errorCount, true)
 			iteration++
-			continue
 		}
-
-		ps.displayHeader(iteration, uptime)
-		processes, procCount, errorCount := ps.scanProcessesWithUptime(uptime)
-		ps.render(processes, procCount, errorCount, true)
-
-		time.Sleep(time.Duration(ps.config.Interval) * time.Second)
-		iteration++
 	}
 }
 
@@ -360,6 +358,10 @@ func (ps *ProcStat) scanProcessesWithUptime(uptime float64) ([]Process, int, int
 
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
+			continue
+		}
+
+		if pid > MaxPIDDisplay {
 			continue
 		}
 
@@ -556,7 +558,7 @@ func (ps *ProcStat) readThread(pid, tid int, uptime float64) *Process {
 		cpu = 100 * ((totalTime / ps.hertz) / uptime)
 	}
 
-	memory := ps.getProcessMemory(tid)
+	memory := ps.getProcessMemory(pid)
 	cmd := "└─ " + sanitizeCmd(stats.CmdName)
 
 	proc := &Process{
@@ -623,30 +625,22 @@ func (ps *ProcStat) getProcessMemory(pid int) float64 {
 }
 
 func sanitizeCmd(cmd string) string {
-	var result strings.Builder
-	result.Grow(len(cmd))
-
-	for _, r := range cmd {
+	return strings.Map(func(r rune) rune {
 		if unicode.IsPrint(r) || r == '\t' || r == '\n' {
-			result.WriteRune(r)
-		} else {
-			result.WriteRune('?')
+			return r
 		}
-	}
-
-	return strings.TrimSpace(result.String())
+		return '?'
+	}, strings.TrimSpace(cmd))
 }
 
 func truncateString(s string, maxLen int) string {
+	if maxLen < 4 {
+		return "..."
+	}
 	if utf8.RuneCountInString(s) <= maxLen {
 		return s
 	}
-
 	runes := []rune(s)
-	if len(runes) <= maxLen-3 {
-		return s
-	}
-
 	return string(runes[:maxLen-3]) + "..."
 }
 
@@ -692,7 +686,11 @@ func (ps *ProcStat) buildProcessTree(processes []Process) (map[int][]Process, ma
 }
 
 func (ps *ProcStat) printTree(process Process, tree map[int][]Process, exists map[int]bool, prefix string, depth int, printed map[int]bool) int {
-	if printed[process.PID] {
+	if printed == nil {
+		printed = make(map[int]bool)
+	}
+
+	if depth > MaxTreeDepth || printed[process.PID] {
 		return 0
 	}
 	printed[process.PID] = true
