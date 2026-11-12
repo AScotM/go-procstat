@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -32,6 +34,9 @@ type Config struct {
 	ThreadLimit int
 	Tree        bool
 	Wide        bool
+	Details     bool
+	JSON        bool
+	Filter      string
 }
 
 type ProcKey struct {
@@ -41,22 +46,31 @@ type ProcKey struct {
 }
 
 type CPUPoint struct {
-	Ticks uint64
+	Ticks      uint64
+	ReadBytes  uint64
+	WriteBytes uint64
 }
 
 type Process struct {
-	PID       int
-	PPID      int
-	CPU       float64
-	MemoryMB  float64
-	RSSBytes  uint64
-	Cmd       string
-	Comm      string
-	State     byte
-	Ticks     uint64
-	StartTime uint64
-	Elapsed   time.Duration
-	Kind      string
+	PID        int
+	PPID       int
+	CPU        float64
+	MemoryMB   float64
+	RSSBytes   uint64
+	Cmd        string
+	Comm       string
+	State      byte
+	Ticks      uint64
+	StartTime  uint64
+	Elapsed    time.Duration
+	Kind       string
+	FDCount    int
+	ReadBytes  uint64
+	WriteBytes uint64
+	ReadRate   float64
+	WriteRate  float64
+	Cgroup     string
+	Unit       string
 }
 
 type ProcStat struct {
@@ -77,6 +91,26 @@ type Snapshot struct {
 	Skipped   int
 	Uptime    time.Duration
 	TakenAt   time.Time
+	System    SystemStats
+}
+
+type Pressure struct {
+	Some      float64 `json:"some_avg10"`
+	Full      float64 `json:"full_avg10"`
+	Available bool    `json:"available"`
+}
+
+type SystemStats struct {
+	MemTotal     uint64   `json:"mem_total_bytes"`
+	MemAvailable uint64   `json:"mem_available_bytes"`
+	SwapTotal    uint64   `json:"swap_total_bytes"`
+	SwapFree     uint64   `json:"swap_free_bytes"`
+	Load1        float64  `json:"load1"`
+	Load5        float64  `json:"load5"`
+	Load15       float64  `json:"load15"`
+	CPU          Pressure `json:"cpu_pressure"`
+	Memory       Pressure `json:"memory_pressure"`
+	IO           Pressure `json:"io_pressure"`
 }
 
 type Monitor struct {
@@ -136,6 +170,9 @@ func parseArgs() (Config, error) {
 	flag.IntVar(&config.ThreadLimit, "thread-limit", 1000, "maximum threads to read per process")
 	flag.BoolVar(&config.Tree, "tree", false, "show process tree")
 	flag.BoolVar(&config.Wide, "wide", false, "do not truncate command lines")
+	flag.BoolVar(&config.Details, "details", false, "show I/O, FDs, cgroup and systemd unit")
+	flag.BoolVar(&config.JSON, "json", false, "output a JSON snapshot (or JSON lines in watch mode)")
+	flag.StringVar(&config.Filter, "filter", "", "case-insensitive command substring filter")
 
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -263,6 +300,9 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 
 	m.assignLifetimeCPU(&snapshot)
+	if m.config.JSON {
+		return m.renderJSON(snapshot)
+	}
 	m.render(snapshot, false, 1)
 
 	return nil
@@ -276,8 +316,14 @@ func (m *Monitor) runWatch(ctx context.Context) error {
 
 	iteration := 1
 	m.assignLifetimeCPU(&previous)
-	m.clearScreen()
-	m.render(previous, true, iteration)
+	if m.config.JSON {
+		if err := m.renderJSON(previous); err != nil {
+			return err
+		}
+	} else {
+		m.clearScreen()
+		m.render(previous, true, iteration)
+	}
 
 	ticker := time.NewTicker(m.config.Interval)
 	defer ticker.Stop()
@@ -300,8 +346,14 @@ func (m *Monitor) runWatch(ctx context.Context) error {
 			m.assignDeltaCPU(&current, previous)
 
 			iteration++
-			m.clearScreen()
-			m.render(current, true, iteration)
+			if m.config.JSON {
+				if err := m.renderJSON(current); err != nil {
+					return err
+				}
+			} else {
+				m.clearScreen()
+				m.render(current, true, iteration)
+			}
 
 			previous = current
 		}
@@ -328,6 +380,7 @@ func (m *Monitor) takeSnapshot() (Snapshot, error) {
 		Points:    make(map[ProcKey]CPUPoint, len(entries)),
 		Uptime:    uptime,
 		TakenAt:   time.Now(),
+		System:    readSystemStats(),
 	}
 
 	for _, entry := range entries {
@@ -353,13 +406,16 @@ func (m *Monitor) takeSnapshot() (Snapshot, error) {
 			continue
 		}
 
+		if m.config.Filter != "" && !strings.Contains(strings.ToLower(proc.Cmd), strings.ToLower(m.config.Filter)) {
+			continue
+		}
 		if proc.State == 'Z' && !m.config.Zombie {
 			continue
 		}
 
 		snapshot.Processes = append(snapshot.Processes, proc)
 		snapshot.Points[proc.key()] = CPUPoint{
-			Ticks: proc.Ticks,
+			Ticks: proc.Ticks, ReadBytes: proc.ReadBytes, WriteBytes: proc.WriteBytes,
 		}
 
 		if m.config.Threads {
@@ -523,18 +579,27 @@ func (m *Monitor) readProcess(
 		elapsed = 0
 	}
 
+	readBytes, writeBytes := readProcessIO(filepath.Join(base, "io"))
+	fdCount := readFDCount(filepath.Join(base, "fd"))
+	cgroup := readCgroup(filepath.Join(base, "cgroup"))
+
 	return Process{
-		PID:       pid,
-		PPID:      stat.PPID,
-		MemoryMB:  bytesToMB(rss),
-		RSSBytes:  rss,
-		Cmd:       cmd,
-		Comm:      stat.Comm,
-		State:     stat.State,
-		Ticks:     ticks,
-		StartTime: stat.StartTime,
-		Elapsed:   elapsed,
-		Kind:      processKind,
+		FDCount:    fdCount,
+		ReadBytes:  readBytes,
+		WriteBytes: writeBytes,
+		Cgroup:     cgroup,
+		Unit:       systemdUnit(cgroup),
+		PID:        pid,
+		PPID:       stat.PPID,
+		MemoryMB:   bytesToMB(rss),
+		RSSBytes:   rss,
+		Cmd:        cmd,
+		Comm:       stat.Comm,
+		State:      stat.State,
+		Ticks:      ticks,
+		StartTime:  stat.StartTime,
+		Elapsed:    elapsed,
+		Kind:       processKind,
 	}, nil
 }
 
@@ -779,6 +844,12 @@ func (m *Monitor) assignDeltaCPU(
 			continue
 		}
 
+		if p.ReadBytes >= old.ReadBytes {
+			p.ReadRate = float64(p.ReadBytes-old.ReadBytes) / wall
+		}
+		if p.WriteBytes >= old.WriteBytes {
+			p.WriteRate = float64(p.WriteBytes-old.WriteBytes) / wall
+		}
 		deltaTicks := p.Ticks - old.Ticks
 
 		p.CPU = clampCPU(
@@ -874,6 +945,9 @@ func (m *Monitor) render(
 	}
 
 	fmt.Println()
+	st := snapshot.System
+	fmt.Printf("Memory %.1f/%.1f MiB used | Swap %.1f/%.1f MiB used | Load %.2f %.2f %.2f\n", bytesToMB(st.MemTotal-st.MemAvailable), bytesToMB(st.MemTotal), bytesToMB(st.SwapTotal-st.SwapFree), bytesToMB(st.SwapTotal), st.Load1, st.Load5, st.Load15)
+	fmt.Printf("PSI avg10 CPU %s | MEM %s | IO %s\n", pressureString(st.CPU), pressureString(st.Memory), pressureString(st.IO))
 	fmt.Println(strings.Repeat("=", 100))
 
 	if len(processes) == 0 {
@@ -946,17 +1020,23 @@ func (m *Monitor) renderTable(
 
 	rows := processes[:limit]
 
-	fmt.Printf(
-		"%-8s %-8s %-7s %-10s %-7s %-11s %s\n",
-		"PID",
-		"PPID",
-		"CPU%",
-		"RSS(MB)",
-		"STATE",
-		"CPU-TIME",
-		"COMMAND",
-	)
+	if !m.config.Details {
+		fmt.Printf(
+			"%-8s %-8s %-7s %-10s %-7s %-11s %s\n",
+			"PID",
+			"PPID",
+			"CPU%",
+			"RSS(MB)",
+			"STATE",
+			"CPU-TIME",
+			"COMMAND",
+		)
 
+	}
+
+	if m.config.Details {
+		fmt.Printf("%-8s %-8s %-10s %-10s %-8s %-14s %-14s %s\n", "PID", "CPU%", "RSS(MB)", "FD", "STATE", "READ KiB/s", "WRITE KiB/s", "CGROUP / UNIT")
+	}
 	fmt.Println(strings.Repeat("-", 100))
 
 	var cpuTotal float64
@@ -975,6 +1055,18 @@ func (m *Monitor) renderTable(
 		}
 
 		cpuTotal += p.CPU
+		if m.config.Details {
+			fd := "-"
+			if p.FDCount >= 0 && p.Kind == processKind {
+				fd = strconv.Itoa(p.FDCount)
+			}
+			group := p.Cgroup
+			if group == "" {
+				group = "-"
+			}
+			fmt.Printf("%-8d %-8.1f %-10s %-10s %-8s %-14.1f %-14.1f %s [%s]\n", p.PID, p.CPU, memory, fd, stateName(p.State), p.ReadRate/1024, p.WriteRate/1024, group, p.Unit)
+			continue
+		}
 
 		fmt.Printf(
 			"%-8d %-8d %-7.1f %-10s %-7s %-11s %s\n",
@@ -1266,4 +1358,167 @@ func minInt(a, b int) int {
 	}
 
 	return b
+}
+
+func readProcessIO(path string) (uint64, uint64) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0
+	}
+	var r, w uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		n, err := strconv.ParseUint(f[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "read_bytes:":
+			r = n
+		case "write_bytes:":
+			w = n
+		}
+	}
+	return r, w
+}
+
+func readFDCount(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return -1
+	}
+	defer f.Close()
+	count := 0
+	for {
+		names, err := f.Readdirnames(256)
+		count += len(names)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return -1
+		}
+	}
+	return count
+}
+
+func readCgroup(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 && parts[0] == "0" && parts[1] == "" {
+			return parts[2]
+		}
+	}
+	return ""
+}
+
+func systemdUnit(group string) string {
+	parts := strings.Split(group, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		p := parts[i]
+		if strings.HasSuffix(p, ".service") || strings.HasSuffix(p, ".scope") || strings.HasSuffix(p, ".slice") {
+			return p
+		}
+	}
+	return "-"
+}
+
+func readPressure(name string) Pressure {
+	data, err := os.ReadFile("/proc/pressure/" + name)
+	if err != nil {
+		return Pressure{}
+	}
+	var p Pressure
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		for _, v := range f[1:] {
+			if !strings.HasPrefix(v, "avg10=") {
+				continue
+			}
+			n, err := strconv.ParseFloat(strings.TrimPrefix(v, "avg10="), 64)
+			if err != nil {
+				continue
+			}
+			if f[0] == "some" {
+				p.Some = n
+				p.Available = true
+			}
+			if f[0] == "full" {
+				p.Full = n
+			}
+		}
+	}
+	return p
+}
+
+func pressureString(p Pressure) string {
+	if !p.Available {
+		return "N/A"
+	}
+	return fmt.Sprintf("some %.2f%% full %.2f%%", p.Some, p.Full)
+}
+
+func readSystemStats() SystemStats {
+	st := SystemStats{CPU: readPressure("cpu"), Memory: readPressure("memory"), IO: readPressure("io")}
+	data, err := os.ReadFile("/proc/meminfo")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			f := strings.Fields(line)
+			if len(f) < 2 {
+				continue
+			}
+			n, err := strconv.ParseUint(f[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			n *= 1024
+			switch f[0] {
+			case "MemTotal:":
+				st.MemTotal = n
+			case "MemAvailable:":
+				st.MemAvailable = n
+			case "SwapTotal:":
+				st.SwapTotal = n
+			case "SwapFree:":
+				st.SwapFree = n
+			}
+		}
+	}
+	data, err = os.ReadFile("/proc/loadavg")
+	if err == nil {
+		f := strings.Fields(string(data))
+		if len(f) >= 3 {
+			st.Load1, _ = strconv.ParseFloat(f[0], 64)
+			st.Load5, _ = strconv.ParseFloat(f[1], 64)
+			st.Load15, _ = strconv.ParseFloat(f[2], 64)
+		}
+	}
+	return st
+}
+
+func (m *Monitor) renderJSON(s Snapshot) error {
+	processes := append([]Process(nil), s.Processes...)
+	m.sortProcesses(processes)
+	if len(processes) > m.config.Limit {
+		processes = processes[:m.config.Limit]
+	}
+	payload := struct {
+		Timestamp     time.Time   `json:"timestamp"`
+		UptimeSeconds float64     `json:"uptime_seconds"`
+		Scanned       int         `json:"scanned"`
+		Skipped       int         `json:"skipped"`
+		System        SystemStats `json:"system"`
+		Processes     []Process   `json:"processes"`
+	}{s.TakenAt, s.Uptime.Seconds(), s.Scanned, s.Skipped, s.System, processes}
+	return json.NewEncoder(os.Stdout).Encode(payload)
 }
